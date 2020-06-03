@@ -121,11 +121,14 @@ class BaseNode(object):
                              timeout=timeout)
 
     def get_status(self):
-        r = requests.get("http://%s:%s/status" % self.rpc_addr(), timeout=2)
-        r.raise_for_status()
-        self.check_refmap()
-        self.check_store()
-        return json.loads(r.content)
+        try:
+            r = requests.get("http://%s:%s/status" % self.rpc_addr(), timeout=2)
+            r.raise_for_status()
+            self.check_refmap()
+            self.check_store()
+            return json.loads(r.content)
+        except:
+            return None
 
     def get_all_heights(self):
         status = self.get_status()
@@ -195,11 +198,14 @@ class BaseNode(object):
                 self.get_status()['validators']))
 
     def stop_checking_refmap(self):
-        print("WARN: Stopping checking Reference Map for inconsistency for %s:%s" % self.addr())
+        print(
+            "WARN: Stopping checking Reference Map for inconsistency for %s:%s"
+            % self.addr())
         self.is_check_refmap = False
 
     def stop_checking_store(self):
-        print("WARN: Stopping checking Storage for inconsistency for %s:%s" % self.addr())
+        print("WARN: Stopping checking Storage for inconsistency for %s:%s" %
+              self.addr())
         self.is_check_store = False
 
     def check_refmap(self):
@@ -226,9 +232,12 @@ class BaseNode(object):
                 pass
             else:
                 if res['result'] == 0:
-                    print("ERROR: Storage for %s:%s in inconsistent state, stopping" % self.addr())
+                    print(
+                        "ERROR: Storage for %s:%s in inconsistent state, stopping"
+                        % self.addr())
                     self.kill()
                 self.store_tests += res['result']
+
 
 class RpcNode(BaseNode):
     """ A running node only interact by rpc queries """

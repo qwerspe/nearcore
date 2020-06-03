@@ -43,8 +43,14 @@ def heights_report():
 
 while max_height < BLOCKS:
     assert time.time() - started < TIMEOUT
+    down_so_far = 0
+    down = None
     for i, node in enumerate(nodes):
         status = node.get_status()
+        if not status:
+            print("down ", i)
+            down = i
+            break
         height = status['sync_info']['latest_block_height']
         hash_ = status['sync_info']['latest_block_hash']
 
@@ -67,6 +73,15 @@ while max_height < BLOCKS:
             if height in seen_heights[j]:
                 last_common[i][j] = height
                 last_common[j][i] = height
+    if down != None:
+        index = down_so_far + down
+        print(f"Node {index} has crashed")
+        nodes.pop(down)
+        down = None
+        down_so_far += 1
+
+    if not nodes:
+        break
 
         # during the time it took to start the test some blocks could have been produced, so the first observed height
         # could be higher than 2, at which point for the nodes for which we haven't queried the height yet the
