@@ -20,9 +20,9 @@ use validator::Validate;
 
 use near_chain_configs::Genesis;
 use near_client::{
-    ClientActor, GetBlock, GetChunk, GetGasPrice, GetNetworkInfo, GetNextLightClientBlock,
-    GetStateChanges, GetStateChangesInBlock, GetValidatorInfo, Query, Status, TxStatus,
-    TxStatusError, ViewClientActor,
+    ClientActor, GetBlock, GetBlockProof, GetChunk, GetExecutionOutcome, GetGasPrice,
+    GetNetworkInfo, GetNextLightClientBlock, GetStateChanges, GetStateChangesInBlock,
+    GetValidatorInfo, Query, Status, TxStatus, TxStatusError, ViewClientActor,
 };
 use near_crypto::PublicKey;
 pub use near_jsonrpc_client as client;
@@ -35,9 +35,9 @@ use near_network::{NetworkClientMessages, NetworkClientResponses};
 use near_primitives::errors::{InvalidTxError, TxExecutionError};
 use near_primitives::hash::CryptoHash;
 use near_primitives::rpc::{
-    RpcBroadcastTxSyncResponse, RpcGenesisRecordsRequest, RpcQueryRequest,
-    RpcStateChangesInBlockRequest, RpcStateChangesInBlockResponse, RpcStateChangesRequest,
-    RpcStateChangesResponse,
+    RpcBroadcastTxSyncResponse, RpcGenesisRecordsRequest, RpcLightClientExecutionProofRequest,
+    RpcLightClientExecutionProofResponse, RpcQueryRequest, RpcStateChangesInBlockRequest,
+    RpcStateChangesInBlockResponse, RpcStateChangesRequest, RpcStateChangesResponse,
 };
 use near_primitives::serialize::{from_base, from_base64, BaseEncode};
 use near_primitives::transaction::SignedTransaction;
@@ -49,7 +49,7 @@ mod metrics;
 
 /// Maximum byte size of the json payload.
 const JSON_PAYLOAD_MAX_SIZE: usize = 2 * 1024 * 1024;
-const QUERY_DATA_MAX_SIZE: usize = 2 * 1024;
+const QUERY_DATA_MAX_SIZE: usize = 10 * 1024;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct RpcPollingConfig {
@@ -201,6 +201,7 @@ impl JsonRpcHandler {
                 "adv_switch_to_height" => Some(self.adv_switch_to_height(params).await),
                 "adv_get_saved_blocks" => Some(self.adv_get_saved_blocks(params).await),
                 "adv_check_refmap" => Some(self.adv_check_refmap(params).await),
+                "adv_check_store" => Some(self.adv_check_store(params).await),
                 _ => None,
             };
 
@@ -226,6 +227,9 @@ impl JsonRpcHandler {
             "EXPERIMENTAL_changes" => self.changes_in_block_by_type(request.params).await,
             "EXPERIMENTAL_changes_in_block" => self.changes_in_block(request.params).await,
             "next_light_client_block" => self.next_light_client_block(request.params).await,
+            "EXPERIMENTAL_light_client_proof" => {
+                self.light_client_execution_outcome_proof(request.params).await
+            }
             "network_info" => self.network_info().await,
             "gas_price" => self.gas_price(request.params).await,
             _ => Err(RpcError::method_not_found(request.method)),
@@ -412,69 +416,63 @@ impl JsonRpcHandler {
     }
 
     async fn query(&self, params: Option<Value>) -> Result<Value, RpcError> {
-        let query_request =
-            if let Ok((path, data)) = parse_params::<(String, String)>(params.clone()) {
-                // Handle a soft-deprecated version of the query API, which is based on
-                // positional arguments with a "path"-style first argument.
-                //
-                // This whole block can be removed one day, when the new API is 100% adopted.
-                let data = from_base_or_parse_err(data)?;
-                let query_data_size = path.len() + data.len();
-                if query_data_size > QUERY_DATA_MAX_SIZE {
-                    return Err(RpcError::server_error(Some(format!(
-                        "Query data size {} is too large",
-                        query_data_size
-                    ))));
-                }
-                let path_parts: Vec<&str> = path.splitn(3, '/').collect();
-                if path_parts.len() <= 1 {
-                    return Err(RpcError::server_error(Some(
-                        "Not enough query parameters provided".to_string(),
-                    )));
-                }
-                let account_id = AccountId::from(path_parts[1].clone());
-                let request = match path_parts[0] {
-                    "account" => QueryRequest::ViewAccount { account_id },
-                    "access_key" => match path_parts.len() {
-                        2 => QueryRequest::ViewAccessKeyList { account_id },
-                        3 => QueryRequest::ViewAccessKey {
-                            account_id,
-                            public_key: PublicKey::try_from(path_parts[2])
-                                .map_err(|_| RpcError::server_error(Some("Invalid public key")))?,
-                        },
-                        _ => {
-                            unreachable!(
-                                "`access_key` query path parts are at least 2 and at most 3 \
-                                 elements due to splitn(3) and the check right after it"
-                            );
-                        }
+        let query_request = if let Ok((path, data)) =
+            parse_params::<(String, String)>(params.clone())
+        {
+            // Handle a soft-deprecated version of the query API, which is based on
+            // positional arguments with a "path"-style first argument.
+            //
+            // This whole block can be removed one day, when the new API is 100% adopted.
+            let data = from_base_or_parse_err(data)?;
+            let query_data_size = path.len() + data.len();
+            if query_data_size > QUERY_DATA_MAX_SIZE {
+                return Err(RpcError::server_error(Some(format!(
+                    "Query data size {} is too large",
+                    query_data_size
+                ))));
+            }
+            let mut path_parts = path.splitn(3, '/');
+            let make_err =
+                || RpcError::server_error(Some("Not enough query parameters provided".to_string()));
+            let query_command = path_parts.next().ok_or_else(make_err)?;
+            let account_id = AccountId::from(path_parts.next().ok_or_else(make_err)?);
+            let maybe_extra_arg = path_parts.next();
+
+            let request = match query_command {
+                "account" => QueryRequest::ViewAccount { account_id },
+                "access_key" => match maybe_extra_arg {
+                    None => QueryRequest::ViewAccessKeyList { account_id },
+                    Some(pk) => QueryRequest::ViewAccessKey {
+                        account_id,
+                        public_key: PublicKey::try_from(pk)
+                            .map_err(|_| RpcError::server_error(Some("Invalid public key")))?,
                     },
-                    "contract" => QueryRequest::ViewState { account_id, prefix: data.into() },
-                    "call" => {
-                        if let Some(method_name) = path_parts.get(2) {
-                            QueryRequest::CallFunction {
-                                account_id,
-                                method_name: method_name.to_string(),
-                                args: data.into(),
-                            }
-                        } else {
-                            return Err(RpcError::server_error(Some(
-                                "Method name is missing".to_string(),
-                            )));
-                        }
+                },
+                "contract" => QueryRequest::ViewState { account_id, prefix: data.into() },
+                "call" => match maybe_extra_arg {
+                    Some(method_name) => QueryRequest::CallFunction {
+                        account_id,
+                        method_name: method_name.to_string(),
+                        args: data.into(),
+                    },
+                    None => {
+                        return Err(RpcError::server_error(Some(
+                            "Method name is missing".to_string(),
+                        )))
                     }
-                    _ => {
-                        return Err(RpcError::server_error(Some(format!(
-                            "Unknown path {}",
-                            path_parts[0]
-                        ))))
-                    }
-                };
-                // Use Finality::None here to make backward compatibility tests work
-                RpcQueryRequest { request, block_id_or_finality: BlockIdOrFinality::latest() }
-            } else {
-                parse_params::<RpcQueryRequest>(params)?
+                },
+                _ => {
+                    return Err(RpcError::server_error(Some(format!(
+                        "Unknown path {}",
+                        query_command
+                    ))))
+                }
             };
+            // Use Finality::None here to make backward compatibility tests work
+            RpcQueryRequest { request, block_id_or_finality: BlockIdOrFinality::latest() }
+        } else {
+            parse_params::<RpcQueryRequest>(params)?
+        };
         let query = Query::new(query_request.block_id_or_finality, query_request.request);
         timeout(self.polling_config.polling_timeout, async {
             loop {
@@ -573,6 +571,34 @@ impl JsonRpcHandler {
     async fn next_light_client_block(&self, params: Option<Value>) -> Result<Value, RpcError> {
         let (last_block_hash,) = parse_params::<(CryptoHash,)>(params)?;
         jsonify(self.view_client_addr.send(GetNextLightClientBlock { last_block_hash }).await)
+    }
+
+    async fn light_client_execution_outcome_proof(
+        &self,
+        params: Option<Value>,
+    ) -> Result<Value, RpcError> {
+        let RpcLightClientExecutionProofRequest { id, light_client_head } = parse_params(params)?;
+        let execution_outcome_proof = self
+            .view_client_addr
+            .send(GetExecutionOutcome { id })
+            .await
+            .map_err(|e| RpcError::from(ServerError::from(e)))?
+            .map_err(|e| RpcError::server_error(Some(e)))?;
+        let block_proof = self
+            .view_client_addr
+            .send(GetBlockProof {
+                block_hash: execution_outcome_proof.outcome_proof.block_hash,
+                head_block_hash: light_client_head,
+            })
+            .await
+            .map_err(|e| RpcError::from(ServerError::from(e)))?;
+        let res = block_proof.map(|block_proof| RpcLightClientExecutionProofResponse {
+            outcome_proof: execution_outcome_proof.outcome_proof,
+            outcome_root_proof: execution_outcome_proof.outcome_root_proof,
+            block_header_lite: block_proof.block_header_lite,
+            block_proof: block_proof.proof,
+        });
+        jsonify(Ok(res))
     }
 
     async fn network_info(&self) -> Result<Value, RpcError> {
@@ -698,6 +724,22 @@ impl JsonRpcHandler {
         match self
             .client_addr
             .send(NetworkClientMessages::Adversarial(NetworkAdversarialMessage::AdvCheckRefMap))
+            .await
+        {
+            Ok(result) => match result {
+                NetworkClientResponses::AdvResult(value) => jsonify(Ok(Ok(value))),
+                _ => Err(RpcError::server_error::<String>(None)),
+            },
+            _ => Err(RpcError::server_error::<String>(None)),
+        }
+    }
+
+    async fn adv_check_store(&self, _params: Option<Value>) -> Result<Value, RpcError> {
+        match self
+            .client_addr
+            .send(NetworkClientMessages::Adversarial(
+                NetworkAdversarialMessage::AdvCheckStorageConsistency,
+            ))
             .await
         {
             Ok(result) => match result {

@@ -61,7 +61,7 @@ genesis_config_changes = [
   ["epoch_length", 1000]
 ]
 
-num_machines = 100
+num_machines = 40
 
 # machine 0-(k-1) run docker, machine k-100 run binary
 num_docker_machines = 0

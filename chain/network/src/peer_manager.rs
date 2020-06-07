@@ -41,7 +41,8 @@ use crate::types::{
     RoutedMessageFrom, SendMessage, SyncData, Unregister,
 };
 use crate::types::{
-    NetworkClientMessages, NetworkConfig, NetworkRequests, NetworkResponses, PeerInfo,
+    KnownPeerState, NetworkClientMessages, NetworkConfig, NetworkRequests, NetworkResponses,
+    PeerInfo,
 };
 
 /// How often to request peers from active peers.
@@ -121,20 +122,24 @@ impl PeerManagerActor {
         debug!(target: "network", "Blacklist: {:?}", config.blacklist);
 
         let me: PeerId = config.public_key.clone().into();
+        let routing_table = RoutingTable::new(me.clone(), store);
+
+        #[cfg(feature = "metric_recorder")]
+        let metric_recorder = MetricRecorder::default().set_me(me.clone());
 
         Ok(PeerManagerActor {
-            peer_id: config.public_key.clone().into(),
+            peer_id: me,
             config,
             client_addr,
             view_client_addr,
             peer_store,
             active_peers: HashMap::default(),
             outgoing_peers: HashSet::default(),
-            routing_table: RoutingTable::new(me.clone(), store),
+            routing_table,
             monitor_peers_attempts: 0,
             pending_update_nonce_request: HashMap::new(),
             #[cfg(feature = "metric_recorder")]
-            metric_recorder: MetricRecorder::default().set_me(me),
+            metric_recorder,
         })
     }
 
@@ -386,20 +391,20 @@ impl PeerManagerActor {
     /// Check if it is needed to create a new outbound connection.
     /// If the number of active connections is less than `ideal_connections_lo` or
     /// (the number of outgoing connections is less than `minimum_outbound_peers`
-    ///     and the total connections is less than `max_peers`)
+    ///     and the total connections is less than `max_num_peers`)
     fn is_outbound_bootstrap_needed(&self) -> bool {
         let total_connections = self.active_peers.len() + self.outgoing_peers.len();
         let potential_outgoing_connections =
             self.num_active_outgoing_peers() + self.outgoing_peers.len();
 
         (total_connections < self.config.ideal_connections_lo as usize
-            || (total_connections < self.config.max_peer as usize
+            || (total_connections < self.config.max_num_peers as usize
                 && potential_outgoing_connections < self.config.minimum_outbound_peers as usize))
             && !self.config.outbound_disabled
     }
 
     fn is_inbound_allowed(&self) -> bool {
-        self.active_peers.len() + self.outgoing_peers.len() < self.config.max_peer as usize
+        self.active_peers.len() + self.outgoing_peers.len() < self.config.max_num_peers as usize
     }
 
     /// Returns single random peer with close to the highest height
@@ -437,8 +442,8 @@ impl PeerManagerActor {
     }
 
     /// Get a random peer we are not connected to from the known list.
-    fn sample_random_peer(&self, ignore_list: &HashSet<PeerId>) -> Option<PeerInfo> {
-        let unconnected_peers = self.peer_store.unconnected_peers(ignore_list);
+    fn sample_random_peer(&self, ignore_fn: impl Fn(&KnownPeerState) -> bool) -> Option<PeerInfo> {
+        let unconnected_peers = self.peer_store.unconnected_peers(ignore_fn);
         unconnected_peers.choose(&mut rand::thread_rng()).cloned()
     }
 
@@ -673,9 +678,13 @@ impl PeerManagerActor {
         }
 
         if self.is_outbound_bootstrap_needed() {
-            let mut ignore_list = self.outgoing_peers.clone();
-            ignore_list.insert(self.peer_id.clone());
-            if let Some(peer_info) = self.sample_random_peer(&ignore_list) {
+            if let Some(peer_info) = self.sample_random_peer(|peer_state| {
+                // Ignore connecting to ourself
+                self.peer_id == peer_state.peer_info.id
+                    || self.config.addr == peer_state.peer_info.addr
+                    // Or to peers we are currently trying to connect to
+                    || self.outgoing_peers.contains(&peer_state.peer_info.id)
+            }) {
                 self.outgoing_peers.insert(peer_info.id.clone());
                 ctx.notify(OutboundTcpConnect { peer_info });
             } else {
@@ -787,6 +796,14 @@ impl PeerManagerActor {
     /// Route signed message to target peer.
     /// Return whether the message is sent or not.
     fn send_signed_message_to_peer(&mut self, ctx: &mut Context<Self>, msg: RoutedMessage) -> bool {
+        // Check if the message is for myself and don't try to send it in that case.
+        if let PeerIdOrHash::PeerId(target) = &msg.target {
+            if target == &self.peer_id {
+                debug!(target: "network", "{:?} Drop signed message to myself ({:?}). Message: {:?}.", self.config.account_id, self.peer_id, msg);
+                return false;
+            }
+        }
+
         match self.routing_table.find_route(&msg.target) {
             Ok(peer_id) => {
                 // Remember if we expect a response for this message.
@@ -919,7 +936,7 @@ impl PeerManagerActor {
                 .map(|a| a.full_peer_info.clone())
                 .collect::<Vec<_>>(),
             num_active_peers: self.num_active_peers(),
-            peer_max_count: self.config.max_peer,
+            peer_max_count: self.config.max_num_peers,
             highest_height_peers: self.highest_height_peers(),
             sent_bytes_per_sec,
             received_bytes_per_sec,
@@ -1096,12 +1113,12 @@ impl Handler<NetworkRequests> for PeerManagerActor {
                     NetworkResponses::RouteNotFound
                 }
             }
-            NetworkRequests::PartialEncodedChunkResponse { route_back, partial_encoded_chunk } => {
+            NetworkRequests::PartialEncodedChunkResponse { route_back, response } => {
                 if self.send_message_to_peer(
                     ctx,
                     RawRoutedMessage {
                         target: AccountOrPeerIdOrHash::Hash(route_back),
-                        body: RoutedMessageBody::PartialEncodedChunk(partial_encoded_chunk),
+                        body: RoutedMessageBody::PartialEncodedChunkResponse(response),
                     },
                 ) {
                     NetworkResponses::NoResponse
@@ -1182,10 +1199,7 @@ impl Handler<NetworkRequests> for PeerManagerActor {
                             if announce_account.epoch_id == current_announce_account.epoch_id {
                                 None
                             } else {
-                                Some((
-                                    announce_account,
-                                    Some(current_announce_account.epoch_id.clone()),
-                                ))
+                                Some((announce_account, Some(current_announce_account.epoch_id)))
                             }
                         } else {
                             Some((announce_account, None))
@@ -1289,20 +1303,20 @@ impl Handler<NetworkRequests> for PeerManagerActor {
                         if cur_edge.edge_type() == EdgeType::Added
                             && cur_edge.nonce >= edge_info.nonce
                         {
-                            return NetworkResponses::EdgeUpdate(cur_edge);
+                            return NetworkResponses::EdgeUpdate(Box::new(cur_edge));
                         }
                     }
 
                     let new_edge = Edge::build_with_secret_key(
                         self.peer_id.clone(),
-                        peer_id.clone(),
+                        peer_id,
                         edge_info.nonce,
                         &self.config.secret_key,
                         edge_info.signature,
                     );
 
                     self.process_edge(ctx, new_edge.clone());
-                    NetworkResponses::EdgeUpdate(new_edge)
+                    NetworkResponses::EdgeUpdate(Box::new(new_edge))
                 } else {
                     NetworkResponses::BanPeer(ReasonForBan::InvalidEdge)
                 }
@@ -1438,7 +1452,7 @@ impl Handler<Consolidate> for PeerManagerActor {
         if last_nonce >= msg.other_edge_info.nonce {
             debug!(target: "network", "Too low nonce. ({} <= {}) {:?} {:?}", msg.other_edge_info.nonce, last_nonce, self.peer_id, msg.peer_info.id);
             // If the check fails don't allow this connection.
-            return ConsolidateResponse::InvalidNonce(last_edge.unwrap());
+            return ConsolidateResponse::InvalidNonce(last_edge.map(Box::new).unwrap());
         }
 
         let require_response = msg.this_edge_info.is_none();
@@ -1559,7 +1573,7 @@ impl Handler<PeerRequest> for PeerManagerActor {
             PeerRequest::RouteBack(body, target) => {
                 self.send_message_to_peer(
                     ctx,
-                    RawRoutedMessage { target: AccountOrPeerIdOrHash::Hash(target), body },
+                    RawRoutedMessage { target: AccountOrPeerIdOrHash::Hash(target), body: *body },
                 );
                 PeerResponse::NoResponse
             }

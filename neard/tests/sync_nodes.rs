@@ -10,16 +10,17 @@ use near_chain::{Block, Chain};
 use near_chain_configs::Genesis;
 use near_client::{ClientActor, GetBlock};
 use near_crypto::{InMemorySigner, KeyType};
+use near_logger_utils::init_integration_logger;
 use near_network::test_utils::{convert_boot_nodes, open_port, WaitOrTimeout};
 use near_network::{NetworkClientMessages, PeerInfo};
 use near_primitives::block::Approval;
-use near_primitives::test_utils::{heavy_test, init_integration_logger};
+use near_primitives::merkle::PartialMerkleTree;
 use near_primitives::transaction::SignedTransaction;
 use near_primitives::types::{BlockHeightDelta, EpochId, ValidatorStake};
 use near_primitives::validator_signer::{InMemoryValidatorSigner, ValidatorSigner};
 use neard::config::{GenesisExt, TESTING_INIT_STAKE};
 use neard::{load_test_config, start_with_config};
-use testlib::genesis_block;
+use testlib::{genesis_block, test_helpers::heavy_test};
 
 // This assumes that there is no height skipped. Otherwise epoch hash calculation will be wrong.
 fn add_blocks(
@@ -30,6 +31,10 @@ fn add_blocks(
     signer: &dyn ValidatorSigner,
 ) -> Vec<Block> {
     let mut prev = &blocks[blocks.len() - 1];
+    let mut block_merkle_tree = PartialMerkleTree::default();
+    for block in blocks.iter() {
+        block_merkle_tree.insert(block.hash());
+    }
     for _ in 0..num {
         let epoch_id = match prev.header.inner_lite.height + 1 {
             height if height <= epoch_length => EpochId::default(),
@@ -62,13 +67,15 @@ fn add_blocks(
             vec![],
             vec![],
             signer,
-            Chain::compute_bp_hash_inner(&vec![ValidatorStake {
+            Chain::compute_bp_hash_inner(vec![ValidatorStake {
                 account_id: "other".to_string(),
                 public_key: signer.public_key(),
                 stake: TESTING_INIT_STAKE,
             }])
             .unwrap(),
+            block_merkle_tree.root(),
         );
+        block_merkle_tree.insert(block.hash());
         let _ = client.do_send(NetworkClientMessages::Block(
             block.clone(),
             PeerInfo::random().id,

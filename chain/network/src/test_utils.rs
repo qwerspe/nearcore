@@ -61,7 +61,7 @@ impl NetworkConfig {
             handshake_timeout: Duration::from_secs(60),
             reconnect_delay: Duration::from_secs(60),
             bootstrap_peers_period: Duration::from_millis(100),
-            max_peer: 10,
+            max_num_peers: 10,
             minimum_outbound_peers: 5,
             ideal_connections_lo: 30,
             ideal_connections_hi: 35,
@@ -172,7 +172,7 @@ impl Actor for WaitOrTimeout {
 }
 
 pub fn vec_ref_to_str(values: Vec<&str>) -> Vec<String> {
-    values.iter().map(|x| x.to_string()).collect()
+    values.into_iter().map(|x| x.to_string()).collect()
 }
 
 pub fn random_peer_id() -> PeerId {

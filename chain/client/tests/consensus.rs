@@ -5,9 +5,9 @@ mod tests {
     use near_chain::Block;
     use near_client::test_utils::setup_mock_all_validators;
     use near_client::{ClientActor, ViewClientActor};
+    use near_logger_utils::init_integration_logger;
     use near_network::{NetworkClientMessages, NetworkRequests, NetworkResponses, PeerInfo};
     use near_primitives::block::{Approval, ApprovalInner};
-    use near_primitives::test_utils::init_integration_logger;
     use near_primitives::types::BlockHeight;
     use rand::{thread_rng, Rng};
     use std::collections::{BTreeMap, HashMap, HashSet};
@@ -22,7 +22,7 @@ mod tests {
     fn test_consensus_with_epoch_switches() {
         init_integration_logger();
 
-        const HEIGHT_GOAL: u64 = 10000;
+        const HEIGHT_GOAL: u64 = 120;
 
         System::run(move || {
             let connectors: Arc<RwLock<Vec<(Addr<ClientActor>, Addr<ViewClientActor>)>>> =
@@ -121,7 +121,7 @@ mod tests {
                                     }
                                 }
 
-                                if *largest_block_height > HEIGHT_GOAL {
+                                if *largest_block_height >= HEIGHT_GOAL {
                                     System::current().stop();
                                 }
                             }
@@ -276,7 +276,9 @@ mod tests {
             );
             *connectors.write().unwrap() = conn;
 
-            near_network::test_utils::wait_or_panic(3000 * HEIGHT_GOAL);
+            // We only check the terminating condition once every 20 heights, thus extra 20 to
+            // account for possibly going beyond the HEIGHT_GOAL.
+            near_network::test_utils::wait_or_panic(3000 * (20 + HEIGHT_GOAL));
         })
         .unwrap();
     }

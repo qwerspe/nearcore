@@ -7,9 +7,9 @@ use ansi_term::Color::{Blue, Cyan, Green, White, Yellow};
 use log::info;
 use sysinfo::{get_current_pid, set_open_files_limit, Pid, ProcessExt, System, SystemExt};
 
-use near_chain::Tip;
 use near_chain_configs::ClientConfig;
 use near_network::types::NetworkInfo;
+use near_primitives::block::Tip;
 use near_primitives::network::PeerId;
 use near_primitives::serialize::to_base;
 use near_primitives::telemetry::{
@@ -134,7 +134,7 @@ impl InfoHelper {
                     .validator_signer
                     .clone()
                     .map(|bp| bp.validator_id().clone())
-                    .unwrap_or("".to_string()),
+                    .unwrap_or_else(String::new),
                 is_validator,
                 status: sync_status.as_variant_name().to_string(),
                 latest_block_hash: to_base(&head.last_block_hash),

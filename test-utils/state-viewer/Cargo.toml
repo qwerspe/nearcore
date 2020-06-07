@@ -8,10 +8,11 @@ edition = "2018"
 clap = "2.33"
 ansi_term = "0.11"
 
-borsh = "0.5.0"
+borsh = "0.6"
 
 near-chain-configs = { path = "../../core/chain-configs" }
 near-crypto = { path = "../../core/crypto" }
+near-logger-utils = {path = "../../test-utils/logger"}
 near-primitives = { path = "../../core/primitives" }
 near-store = { path = "../../core/store" }
 node-runtime = { path = "../../runtime/runtime" }
@@ -21,5 +22,4 @@ neard = { path = "../../neard" }
 
 [dev-dependencies]
 serde_json = "1"
-
 near-client = { path = "../../chain/client" }

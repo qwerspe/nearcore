@@ -5,7 +5,9 @@ use chrono::{DateTime, Utc};
 use failure::{Backtrace, Context, Fail};
 
 use near_primitives::challenge::{ChunkProofs, ChunkState};
+use near_primitives::errors::{EpochError, StorageError};
 use near_primitives::hash::CryptoHash;
+use near_primitives::serialize::to_base;
 use near_primitives::sharding::{ChunkHash, ShardChunkHeader};
 use near_primitives::types::ShardId;
 
@@ -22,7 +24,7 @@ pub enum ErrorKind {
     /// Orphan block.
     #[fail(display = "Orphan")]
     Orphan,
-    /// Block is not availiable (e.g. garbage collected)
+    /// Block is not available (e.g. garbage collected)
     #[fail(display = "Block Missing (unavailable on the node): {}", _0)]
     BlockMissing(CryptoHash),
     /// Chunk is missing.
@@ -87,10 +89,10 @@ pub enum ErrorKind {
     InvalidChunk,
     /// One of the chunks has invalid proofs
     #[fail(display = "Invalid Chunk Proofs")]
-    InvalidChunkProofs(ChunkProofs),
+    InvalidChunkProofs(Box<ChunkProofs>),
     /// Invalid chunk state.
     #[fail(display = "Invalid Chunk State")]
-    InvalidChunkState(ChunkState),
+    InvalidChunkState(Box<ChunkState>),
     /// Invalid chunk mask
     #[fail(display = "Invalid Chunk Mask")]
     InvalidChunkMask,
@@ -127,9 +129,6 @@ pub enum ErrorKind {
     /// Invalid Gas Used
     #[fail(display = "Invalid Gas Used")]
     InvalidGasUsed,
-    /// Invalid Validator Reward
-    #[fail(display = "Invalid Validator Reward")]
-    InvalidReward,
     /// Invalid Balance Burnt
     #[fail(display = "Invalid Balance Burnt")]
     InvalidBalanceBurnt,
@@ -142,6 +141,9 @@ pub enum ErrorKind {
     /// Invalid VRF proof, or incorrect random_output in the header
     #[fail(display = "Invalid Randomness Beacon Output")]
     InvalidRandomnessBeaconOutput,
+    /// Invalid block merkle root.
+    #[fail(display = "Invalid Block Merkle Root")]
+    InvalidBlockMerkleRoot,
     /// Someone is not a validator. Usually happens in signature verification
     #[fail(display = "Not A Validator")]
     NotAValidator,
@@ -161,8 +163,8 @@ pub enum ErrorKind {
     #[fail(display = "DB Not Found Error: {}", _0)]
     DBNotFoundErr(String),
     /// Storage error. Used for internal passing the error.
-    #[fail(display = "Storage Error")]
-    StorageError,
+    #[fail(display = "Storage Error: {}", _0)]
+    StorageError(StorageError),
     /// GC error.
     #[fail(display = "GC Error: {}", _0)]
     GCError(String),
@@ -213,7 +215,7 @@ impl Error {
             // TODO: can be either way?
             | ErrorKind::EpochOutOfBounds
             | ErrorKind::ChallengedBlockOnChain
-            | ErrorKind::StorageError
+            | ErrorKind::StorageError(_)
             | ErrorKind::GCError(_)
             | ErrorKind::DBNotFoundErr(_) => false,
             ErrorKind::InvalidBlockPastTime(_, _)
@@ -247,11 +249,11 @@ impl Error {
             | ErrorKind::InvalidGasLimit
             | ErrorKind::InvalidGasPrice
             | ErrorKind::InvalidGasUsed
-            | ErrorKind::InvalidReward
             | ErrorKind::InvalidBalanceBurnt
             | ErrorKind::InvalidShardId(_)
             | ErrorKind::InvalidStateRequest(_)
             | ErrorKind::InvalidRandomnessBeaconOutput
+            | ErrorKind::InvalidBlockMerkleRoot
             | ErrorKind::NotAValidator => true,
         }
     }
@@ -283,3 +285,14 @@ impl From<String> for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<EpochError> for Error {
+    fn from(error: EpochError) -> Self {
+        match error {
+            EpochError::EpochOutOfBounds => ErrorKind::EpochOutOfBounds,
+            EpochError::MissingBlock(h) => ErrorKind::DBNotFoundErr(to_base(&h)),
+            err => ErrorKind::ValidatorError(err.to_string()),
+        }
+        .into()
+    }
+}

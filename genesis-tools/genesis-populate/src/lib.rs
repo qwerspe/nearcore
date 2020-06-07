@@ -9,15 +9,17 @@ use std::sync::Arc;
 use borsh::BorshSerialize;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use near_chain::{Block, Chain, ChainStore, RuntimeAdapter, Tip};
+use near_chain::{Block, Chain, ChainStore, RuntimeAdapter};
 use near_chain_configs::Genesis;
 use near_crypto::{InMemorySigner, KeyType};
 use near_primitives::account::{AccessKey, Account};
-use near_primitives::block::genesis_chunks;
+use near_primitives::block::{genesis_chunks, Tip};
 use near_primitives::contract::ContractCode;
 use near_primitives::hash::{hash, CryptoHash};
 use near_primitives::state_record::StateRecord;
-use near_primitives::types::{AccountId, Balance, ChunkExtra, EpochId, ShardId, StateRoot};
+use near_primitives::types::{
+    AccountId, Balance, ChunkExtra, EpochId, ShardId, StateChangeCause, StateRoot,
+};
 use near_store::{
     create_store, get_account, set_access_key, set_account, set_code, ColState, Store, TrieUpdate,
 };
@@ -111,7 +113,7 @@ impl GenesisBuilder {
             .roots
             .iter()
             .map(|(shard_idx, root)| {
-                (*shard_idx, TrieUpdate::new(self.runtime.trie.clone(), *root))
+                (*shard_idx, self.runtime.get_tries().new_trie_update(*shard_idx, *root))
             })
             .collect();
         self.unflushed_records =
@@ -167,12 +169,14 @@ impl GenesisBuilder {
             account.storage_usage = storage_usage;
             set_account(&mut state_update, account_id, &account);
         }
-        let trie = state_update.trie.clone();
-        let (store_update, root) = state_update.finalize()?.0.into(trie)?;
+        let tries = self.runtime.get_tries();
+        state_update.commit(StateChangeCause::InitialState);
+        let trie_changes = state_update.finalize()?.0;
+        let (store_update, root) = tries.apply_all(&trie_changes, shard_idx)?;
         store_update.commit()?;
 
         self.roots.insert(shard_idx, root.clone());
-        self.state_updates.insert(shard_idx, TrieUpdate::new(self.runtime.trie.clone(), root));
+        self.state_updates.insert(shard_idx, tries.new_trie_update(shard_idx, root));
         Ok(())
     }
 
@@ -205,11 +209,12 @@ impl GenesisBuilder {
                 vec![],
                 vec![],
                 vec![],
-                0,
                 self.genesis.config.total_supply.clone(),
             )
             .unwrap();
-        store_update.save_block_header(genesis.header.clone());
+        store_update
+            .save_block_header(genesis.header.clone())
+            .expect("save genesis block header shouldn't fail");
         store_update.save_block(genesis.clone());
 
         for (chunk_header, state_root) in genesis.chunks.iter().zip(self.roots.values()) {
@@ -222,7 +227,6 @@ impl GenesisBuilder {
                     vec![],
                     0,
                     self.genesis.config.gas_limit.clone(),
-                    0,
                     0,
                 ),
             );
@@ -262,7 +266,7 @@ impl GenesisBuilder {
         set_access_key(
             &mut state_update,
             account_id.clone(),
-            signer.public_key.clone(),
+            signer.public_key,
             &AccessKey::full_access(),
         );
         records.push(access_key_record);

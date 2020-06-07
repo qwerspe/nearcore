@@ -6,6 +6,7 @@ use cached::{Cached, SizedCache};
 use log::{debug, info, warn};
 use primitive_types::U256;
 
+use near_primitives::errors::EpochError;
 use near_primitives::hash::CryptoHash;
 use near_primitives::types::{
     AccountId, ApprovalStake, Balance, BlockChunkValidatorStats, BlockHeight, EpochId, ShardId,
@@ -18,9 +19,8 @@ use near_store::{ColBlockInfo, ColEpochInfo, ColEpochStart, Store, StoreUpdate};
 
 use crate::proposals::proposals_to_epoch_info;
 pub use crate::reward_calculator::RewardCalculator;
-use crate::types::EpochError::EpochOutOfBounds;
 use crate::types::EpochSummary;
-pub use crate::types::{BlockInfo, EpochConfig, EpochError, EpochInfo, RngSeed, SlashState};
+pub use crate::types::{BlockInfo, EpochConfig, EpochInfo, RngSeed, SlashState};
 
 mod proposals;
 mod reward_calculator;
@@ -132,7 +132,6 @@ impl EpochManager {
                 .get(&(i as u64))
                 .unwrap_or_else(|| &ValidatorStats { expected: 0, produced: 0 });
             // Note, validator_kickout_threshold is 0..100, so we use * 100 to keep this in integer space.
-            println!("account {} stat {:?}", account_id, block_stats);
             if block_stats.produced * 100
                 < u64::from(block_producer_kickout_threshold) * block_stats.expected
             {
@@ -199,7 +198,6 @@ impl EpochManager {
         let mut validator_kickout = HashMap::new();
         let block_validator_tracker = last_block_info.block_tracker.clone();
         let chunk_validator_tracker = last_block_info.shard_tracker.clone();
-        let total_validator_reward = last_block_info.total_validator_reward;
 
         // Gather slashed validators and add them to kick out first.
         let slashed_validators = last_block_info.slashed.clone();
@@ -219,7 +217,7 @@ impl EpochManager {
                 // This code relies on the fact that within a block the proposals are ordered
                 // in the order they are added. So we only take the last proposal for any given
                 // account in this manner.
-                proposals.entry(proposal.account_id.clone()).or_insert(proposal.clone());
+                proposals.entry(proposal.account_id.clone()).or_insert_with(|| proposal.clone());
             }
         }
 
@@ -258,7 +256,6 @@ impl EpochManager {
             all_proposals,
             validator_kickout,
             validator_block_chunk_stats,
-            total_validator_reward,
         })
     }
 
@@ -270,9 +267,10 @@ impl EpochManager {
         account_id: &AccountId,
     ) -> Result<ValidatorStats, EpochError> {
         let epoch_info = self.get_epoch_info(&epoch_id)?;
-        let validator_id = *epoch_info.validator_to_index.get(account_id).ok_or_else(|| {
-            EpochError::Other(format!("{} is not a validator in epoch {:?}", account_id, epoch_id))
-        })?;
+        let validator_id = *epoch_info
+            .validator_to_index
+            .get(account_id)
+            .ok_or_else(|| EpochError::NotAValidator(account_id.clone(), epoch_id.clone()))?;
         let block_info = self.get_block_info(last_known_block_hash)?.clone();
         let validator_stats = block_info
             .block_tracker
@@ -295,7 +293,6 @@ impl EpochManager {
             all_proposals,
             validator_kickout,
             validator_block_chunk_stats,
-            total_validator_reward,
         } = self.collect_blocks_info(&block_info, last_block_hash)?;
         let epoch_id = self.get_epoch_id(last_block_hash)?;
         let epoch_info = self.get_epoch_info(&epoch_id)?;
@@ -307,10 +304,9 @@ impl EpochManager {
             .collect::<HashMap<_, _>>();
         let next_epoch_id = self.get_next_epoch_id(last_block_hash)?;
         let next_epoch_info = self.get_epoch_info(&next_epoch_id)?.clone();
-        let (validator_reward, inflation) = self.reward_calculator.calculate_reward(
+        let (validator_reward, minted_amount) = self.reward_calculator.calculate_reward(
             validator_block_chunk_stats,
             &validator_stake,
-            total_validator_reward,
             block_info.total_supply,
         );
         info!("all proposals: {:?} kickout: {:?}", all_proposals, validator_kickout);
@@ -321,11 +317,11 @@ impl EpochManager {
             all_proposals,
             validator_kickout,
             validator_reward,
-            inflation,
+            minted_amount,
         ) {
             Ok(next_next_epoch_info) => next_next_epoch_info,
-            Err(EpochError::ThresholdError(amount, num_seats)) => {
-                warn!(target: "epoch_manager", "Not enough stake for required number of seats (all validators tried to unstake?): amount = {} for {}", amount, num_seats);
+            Err(EpochError::ThresholdError { stake_sum, num_seats }) => {
+                warn!(target: "epoch_manager", "Not enough stake for required number of seats (all validators tried to unstake?): amount = {} for {}", stake_sum, num_seats);
                 let mut epoch_info = next_epoch_info.clone();
                 epoch_info.epoch_height += 1;
                 epoch_info
@@ -354,7 +350,7 @@ impl EpochManager {
                 assert_eq!(block_info.proposals.len(), 0);
                 let pre_genesis_epoch_id = EpochId::default();
                 let genesis_epoch_info = self.get_epoch_info(&pre_genesis_epoch_id)?.clone();
-                self.save_block_info(&mut store_update, current_hash, block_info.clone())?;
+                self.save_block_info(&mut store_update, current_hash, block_info)?;
                 self.save_epoch_info(
                     &mut store_update,
                     &EpochId(*current_hash),
@@ -397,7 +393,7 @@ impl EpochManager {
                             block_info
                                 .slashed
                                 .entry(account_id.clone())
-                                .or_insert(slash_state.clone());
+                                .or_insert_with(|| slash_state.clone());
                         }
                     } else {
                         block_info
@@ -408,17 +404,12 @@ impl EpochManager {
                                     *e = SlashState::Other;
                                 }
                             })
-                            .or_insert(slash_state.clone());
+                            .or_insert_with(|| slash_state.clone());
                     }
                 }
 
-                let BlockInfo {
-                    block_tracker,
-                    mut all_proposals,
-                    shard_tracker,
-                    total_validator_reward,
-                    ..
-                } = prev_block_info;
+                let BlockInfo { block_tracker, mut all_proposals, shard_tracker, .. } =
+                    prev_block_info;
 
                 // Update block produced/expected tracker.
                 block_info.update_block_tracker(
@@ -434,7 +425,6 @@ impl EpochManager {
                 // accumulate values
                 if is_epoch_start {
                     block_info.all_proposals = block_info.proposals.clone();
-                    block_info.total_validator_reward = block_info.validator_reward;
                     self.save_epoch_start(
                         &mut store_update,
                         &block_info.epoch_id,
@@ -443,8 +433,6 @@ impl EpochManager {
                 } else {
                     all_proposals.extend(block_info.proposals.clone());
                     block_info.all_proposals = all_proposals;
-                    block_info.total_validator_reward +=
-                        total_validator_reward + block_info.validator_reward;
                 }
 
                 // Save current block info.
@@ -880,10 +868,6 @@ impl EpochManager {
         })
     }
 
-    pub fn get_epoch_inflation(&mut self, epoch_id: &EpochId) -> Result<Balance, EpochError> {
-        Ok(self.get_epoch_info(epoch_id)?.inflation)
-    }
-
     /// Compare two epoch ids based on their start height. This works because finality gadget
     /// guarantees that we cannot have two different epochs on two forks
     pub fn compare_epoch_id(
@@ -901,7 +885,7 @@ impl EpochManager {
             (Ok(index1), Ok(index2)) => Ok(index1.cmp(&index2)),
             (Ok(_), Err(_)) => self.get_epoch_info(other_epoch_id).map(|_| Ordering::Less),
             (Err(_), Ok(_)) => self.get_epoch_info(epoch_id).map(|_| Ordering::Greater),
-            (Err(_), Err(_)) => Err(EpochOutOfBounds),
+            (Err(_), Err(_)) => Err(EpochError::EpochOutOfBounds),
         }
     }
 }
@@ -1023,7 +1007,7 @@ impl EpochManager {
 
     /// Get BlockInfo for a block
     /// # Errors
-    /// EpochError::Other if storage returned an error
+    /// EpochError::IOErr if storage returned an error
     /// EpochError::MissingBlock if block is not in storage
     pub fn get_block_info(&mut self, hash: &CryptoHash) -> Result<&BlockInfo, EpochError> {
         if self.blocks_info.cache_get(hash).is_none() {
@@ -1476,7 +1460,6 @@ mod tests {
                     vec![],
                     vec![],
                     vec![SlashedValidator::new("test1".to_string(), false)],
-                    0,
                     DEFAULT_TOTAL_SUPPLY,
                 ),
                 [0; 32],
@@ -1563,7 +1546,6 @@ mod tests {
                         SlashedValidator::new("test1".to_string(), true),
                         SlashedValidator::new("test1".to_string(), false),
                     ],
-                    0,
                     DEFAULT_TOTAL_SUPPLY,
                 ),
                 [0; 32],
@@ -1590,7 +1572,6 @@ mod tests {
                     vec![],
                     vec![],
                     vec![SlashedValidator::new("test1".to_string(), true)],
-                    0,
                     DEFAULT_TOTAL_SUPPLY,
                 ),
                 [0; 32],
@@ -1650,7 +1631,6 @@ mod tests {
                     vec![],
                     vec![],
                     vec![SlashedValidator::new("test1".to_string(), true)],
-                    0,
                     DEFAULT_TOTAL_SUPPLY,
                 ),
                 [0; 32],
@@ -1678,7 +1658,6 @@ mod tests {
                     vec![],
                     vec![],
                     vec![SlashedValidator::new("test1".to_string(), true)],
-                    0,
                     DEFAULT_TOTAL_SUPPLY,
                 ),
                 [0; 32],
@@ -1732,6 +1711,8 @@ mod tests {
             epoch_length,
             protocol_reward_percentage: Rational::new(1, 10),
             protocol_treasury_account: "near".to_string(),
+            online_min_threshold: Rational::new(90, 100),
+            online_max_threshold: Rational::new(99, 100),
         };
         let mut epoch_manager = setup_epoch_manager(
             validators,
@@ -1758,12 +1739,10 @@ mod tests {
                     proposals: vec![],
                     chunk_mask: vec![true],
                     slashed: Default::default(),
-                    validator_reward: 0,
                     total_supply,
                     block_tracker: Default::default(),
                     shard_tracker: Default::default(),
                     all_proposals: vec![],
-                    total_validator_reward: 0,
                 },
                 rng_seed,
             )
@@ -1780,12 +1759,10 @@ mod tests {
                     proposals: vec![],
                     chunk_mask: vec![true],
                     slashed: Default::default(),
-                    validator_reward: 10,
                     total_supply,
                     block_tracker: Default::default(),
                     shard_tracker: Default::default(),
                     all_proposals: vec![],
-                    total_validator_reward: 0,
                 },
                 rng_seed,
             )
@@ -1802,12 +1779,10 @@ mod tests {
                     proposals: vec![],
                     chunk_mask: vec![true],
                     slashed: Default::default(),
-                    validator_reward: 10,
                     total_supply,
                     block_tracker: Default::default(),
                     shard_tracker: Default::default(),
                     all_proposals: vec![],
-                    total_validator_reward: 0,
                 },
                 rng_seed,
             )
@@ -1825,7 +1800,6 @@ mod tests {
         let (validator_reward, inflation) = reward_calculator.calculate_reward(
             validator_online_ratio,
             &validator_stakes,
-            20,
             total_supply,
         );
         let test2_reward = *validator_reward.get("test2").unwrap();
@@ -1861,6 +1835,8 @@ mod tests {
             epoch_length,
             protocol_reward_percentage: Rational::new(1, 10),
             protocol_treasury_account: "near".to_string(),
+            online_min_threshold: Rational::new(90, 100),
+            online_max_threshold: Rational::new(99, 100),
         };
         let mut epoch_manager = setup_epoch_manager(
             validators,
@@ -1887,12 +1863,10 @@ mod tests {
                     proposals: vec![],
                     chunk_mask: vec![true],
                     slashed: Default::default(),
-                    validator_reward: 0,
                     total_supply,
                     block_tracker: Default::default(),
                     shard_tracker: Default::default(),
                     all_proposals: vec![],
-                    total_validator_reward: 0,
                 },
                 rng_seed,
             )
@@ -1909,12 +1883,10 @@ mod tests {
                     proposals: vec![],
                     chunk_mask: vec![true],
                     slashed: Default::default(),
-                    validator_reward: 10,
                     total_supply,
                     block_tracker: Default::default(),
                     shard_tracker: Default::default(),
                     all_proposals: vec![],
-                    total_validator_reward: 0,
                 },
                 rng_seed,
             )
@@ -1931,12 +1903,10 @@ mod tests {
                     proposals: vec![],
                     chunk_mask: vec![true],
                     slashed: Default::default(),
-                    validator_reward: 10,
                     total_supply,
                     block_tracker: Default::default(),
                     shard_tracker: Default::default(),
                     all_proposals: vec![],
-                    total_validator_reward: 0,
                 },
                 rng_seed,
             )
@@ -1962,7 +1932,6 @@ mod tests {
         let (validator_reward, inflation) = reward_calculator.calculate_reward(
             validator_online_ratio,
             &validators_stakes,
-            20,
             total_supply,
         );
         let test1_reward = *validator_reward.get("test1").unwrap();
@@ -2009,6 +1978,8 @@ mod tests {
             epoch_length,
             protocol_reward_percentage: Rational::new(1, 10),
             protocol_treasury_account: "near".to_string(),
+            online_min_threshold: Rational::new(90, 100),
+            online_max_threshold: Rational::new(99, 100),
         };
         let mut epoch_manager = setup_epoch_manager(
             validators,
@@ -2035,12 +2006,10 @@ mod tests {
                     proposals: vec![],
                     chunk_mask: vec![],
                     slashed: Default::default(),
-                    validator_reward: 0,
                     total_supply,
                     block_tracker: Default::default(),
                     shard_tracker: Default::default(),
                     all_proposals: vec![],
-                    total_validator_reward: 0,
                 },
                 rng_seed,
             )
@@ -2057,12 +2026,10 @@ mod tests {
                     proposals: vec![],
                     chunk_mask: vec![true, false],
                     slashed: Default::default(),
-                    validator_reward: 10,
                     total_supply,
                     block_tracker: Default::default(),
                     shard_tracker: Default::default(),
                     all_proposals: vec![],
-                    total_validator_reward: 0,
                 },
                 rng_seed,
             )
@@ -2079,12 +2046,10 @@ mod tests {
                     proposals: vec![],
                     chunk_mask: vec![true, true],
                     slashed: Default::default(),
-                    validator_reward: 10,
                     total_supply,
                     block_tracker: Default::default(),
                     shard_tracker: Default::default(),
                     all_proposals: vec![],
-                    total_validator_reward: 0,
                 },
                 rng_seed,
             )
@@ -2103,7 +2068,6 @@ mod tests {
         let (validator_reward, inflation) = reward_calculator.calculate_reward(
             validator_online_ratio,
             &validators_stakes,
-            20,
             total_supply,
         );
         let test2_reward = *validator_reward.get("test2").unwrap();
@@ -2200,12 +2164,10 @@ mod tests {
                     proposals: vec![],
                     chunk_mask: vec![],
                     slashed: Default::default(),
-                    validator_reward: 0,
                     total_supply,
                     block_tracker: Default::default(),
                     shard_tracker: Default::default(),
                     all_proposals: vec![],
-                    total_validator_reward: 0,
                 },
                 rng_seed,
             )
@@ -2222,12 +2184,10 @@ mod tests {
                     proposals: vec![],
                     chunk_mask: vec![true, true, true],
                     slashed: Default::default(),
-                    validator_reward: 0,
                     total_supply,
                     block_tracker: Default::default(),
                     shard_tracker: Default::default(),
                     all_proposals: vec![],
-                    total_validator_reward: 0,
                 },
                 rng_seed,
             )
@@ -2244,12 +2204,10 @@ mod tests {
                     proposals: vec![],
                     chunk_mask: vec![true, true, true],
                     slashed: Default::default(),
-                    validator_reward: 0,
                     total_supply,
                     block_tracker: Default::default(),
                     shard_tracker: Default::default(),
                     all_proposals: vec![],
-                    total_validator_reward: 0,
                 },
                 rng_seed,
             )
@@ -2309,12 +2267,10 @@ mod tests {
                     proposals: vec![],
                     chunk_mask: vec![false],
                     slashed: Default::default(),
-                    validator_reward: 0,
                     total_supply,
                     block_tracker: Default::default(),
                     shard_tracker: Default::default(),
                     all_proposals: vec![],
-                    total_validator_reward: 0,
                 },
                 rng_seed,
             )
@@ -2468,12 +2424,10 @@ mod tests {
                 proposals: vec![],
                 chunk_mask: vec![true, true, true, false],
                 slashed: Default::default(),
-                validator_reward: 0,
                 total_supply,
                 block_tracker: Default::default(),
                 shard_tracker: Default::default(),
                 all_proposals: vec![],
-                total_validator_reward: 0,
             },
             rng_seed,
         )
@@ -2489,12 +2443,10 @@ mod tests {
                 proposals: vec![],
                 chunk_mask: vec![true, true, true, false],
                 slashed: Default::default(),
-                validator_reward: 0,
                 total_supply,
                 block_tracker: Default::default(),
                 shard_tracker: Default::default(),
                 all_proposals: vec![],
-                total_validator_reward: 0,
             },
             rng_seed,
         )
@@ -2510,12 +2462,10 @@ mod tests {
                 proposals: vec![],
                 chunk_mask: vec![true, true, true, true],
                 slashed: Default::default(),
-                validator_reward: 0,
                 total_supply,
                 block_tracker: Default::default(),
                 shard_tracker: Default::default(),
                 all_proposals: vec![],
-                total_validator_reward: 0,
             },
             rng_seed,
         )

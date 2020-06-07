@@ -10,12 +10,13 @@ use num_rational::Rational;
 
 use near_chain::chain::{check_refcount_map, NUM_EPOCHS_TO_KEEP_STORE_DATA};
 use near_chain::{Block, ChainGenesis, ChainStoreAccess, ErrorKind, Provenance, RuntimeAdapter};
-use near_chain_configs::Genesis;
+use near_chain_configs::{ClientConfig, Genesis};
 use near_chunks::{ChunkStatus, ShardsManager};
 use near_client::test_utils::setup_mock_all_validators;
 use near_client::test_utils::{setup_client, setup_mock, TestEnv};
-use near_client::{Client, GetBlock};
+use near_client::{Client, GetBlock, GetBlockWithMerkleTree};
 use near_crypto::{InMemorySigner, KeyType, Signature, Signer};
+use near_logger_utils::init_test_logger;
 #[cfg(feature = "metric_recorder")]
 use near_network::recorder::MetricRecorder;
 use near_network::routing::EdgeInfo;
@@ -28,13 +29,13 @@ use near_network::{
 use near_primitives::block::{Approval, ApprovalInner, BlockHeader};
 use near_primitives::errors::InvalidTxError;
 use near_primitives::hash::{hash, CryptoHash};
-use near_primitives::merkle::merklize;
+use near_primitives::merkle::{merklize, verify_hash};
 use near_primitives::sharding::{EncodedShardChunk, ReedSolomonWrapper};
-use near_primitives::test_utils::init_test_logger;
 use near_primitives::transaction::{SignedTransaction, Transaction};
 use near_primitives::types::{BlockHeight, EpochId, MerkleHash, NumBlocks};
 use near_primitives::utils::to_timestamp;
 use near_primitives::validator_signer::{InMemoryValidatorSigner, ValidatorSigner};
+use near_primitives::views::{QueryRequest, QueryResponseKind};
 use near_store::test_utils::create_test_store;
 use neard::config::{GenesisExt, TESTING_INIT_BALANCE, TESTING_INIT_STAKE};
 use neard::NEAR_BASE;
@@ -84,7 +85,7 @@ fn produce_blocks_with_tx() {
                     partial_encoded_chunk,
                 } = msg
                 {
-                    let header = partial_encoded_chunk.header.clone().unwrap();
+                    let header = partial_encoded_chunk.header.clone();
                     let height = header.inner.height_created as usize;
                     assert!(encoded_chunks.len() + 2 >= height);
 
@@ -157,9 +158,10 @@ fn receive_network_block() {
                 NetworkResponses::NoResponse
             }),
         );
-        actix::spawn(view_client.send(GetBlock::latest()).then(move |res| {
-            let last_block = res.unwrap().unwrap();
+        actix::spawn(view_client.send(GetBlockWithMerkleTree::latest()).then(move |res| {
+            let (last_block, mut block_merkle_tree) = res.unwrap().unwrap();
             let signer = InMemoryValidatorSigner::from_seed("test1", KeyType::ED25519, "test1");
+            block_merkle_tree.insert(last_block.header.hash);
             let block = Block::produce(
                 &last_block.header.clone().into(),
                 last_block.header.height + 1,
@@ -178,73 +180,9 @@ fn receive_network_block() {
                 vec![],
                 &signer,
                 last_block.header.next_bp_hash,
+                block_merkle_tree.root(),
             );
             client.do_send(NetworkClientMessages::Block(block, PeerInfo::random().id, false));
-            future::ready(())
-        }));
-        near_network::test_utils::wait_or_panic(5000);
-    })
-    .unwrap();
-}
-
-/// Runs client that receives a block from network and announces header to the network.
-#[test]
-fn receive_network_block_header() {
-    let block_holder: Arc<RwLock<Option<Block>>> = Arc::new(RwLock::new(None));
-    init_test_logger();
-    System::run(|| {
-        let block_holder1 = block_holder.clone();
-        let (client, view_client) = setup_mock(
-            vec!["test"],
-            "other",
-            true,
-            false,
-            Box::new(move |msg, _ctx, client_addr| match msg {
-                NetworkRequests::BlockRequest { hash, peer_id } => {
-                    let block = block_holder1.read().unwrap().clone().unwrap();
-                    assert_eq!(hash, &block.hash());
-                    actix::spawn(
-                        client_addr
-                            .send(NetworkClientMessages::Block(block, peer_id.clone(), false))
-                            .map(drop),
-                    );
-                    NetworkResponses::NoResponse
-                }
-                NetworkRequests::Approval { .. } => {
-                    System::current().stop();
-                    NetworkResponses::NoResponse
-                }
-                _ => NetworkResponses::NoResponse,
-            }),
-        );
-        actix::spawn(view_client.send(GetBlock::latest()).then(move |res| {
-            let last_block = res.unwrap().unwrap();
-            let signer = InMemoryValidatorSigner::from_seed("test", KeyType::ED25519, "test");
-            let block = Block::produce(
-                &last_block.header.clone().into(),
-                last_block.header.height + 1,
-                last_block.chunks.into_iter().map(Into::into).collect(),
-                EpochId::default(),
-                if last_block.header.prev_hash == CryptoHash::default() {
-                    EpochId(last_block.header.hash)
-                } else {
-                    EpochId(last_block.header.next_epoch_id.clone())
-                },
-                vec![],
-                Rational::from_integer(0),
-                0,
-                None,
-                vec![],
-                vec![],
-                &signer,
-                last_block.header.next_bp_hash,
-            );
-            client.do_send(NetworkClientMessages::Block(
-                block.clone(),
-                PeerInfo::random().id,
-                false,
-            ));
-            *block_holder.write().unwrap() = Some(block);
             future::ready(())
         }));
         near_network::test_utils::wait_or_panic(5000);
@@ -288,9 +226,10 @@ fn produce_block_with_approvals() {
                 NetworkResponses::NoResponse
             }),
         );
-        actix::spawn(view_client.send(GetBlock::latest()).then(move |res| {
-            let last_block = res.unwrap().unwrap();
+        actix::spawn(view_client.send(GetBlockWithMerkleTree::latest()).then(move |res| {
+            let (last_block, mut block_merkle_tree) = res.unwrap().unwrap();
             let signer1 = InMemoryValidatorSigner::from_seed("test2", KeyType::ED25519, "test2");
+            block_merkle_tree.insert(last_block.header.hash);
             let block = Block::produce(
                 &last_block.header.clone().into(),
                 last_block.header.height + 1,
@@ -309,6 +248,7 @@ fn produce_block_with_approvals() {
                 vec![],
                 &signer1,
                 last_block.header.next_bp_hash,
+                block_merkle_tree.root(),
             );
             client.do_send(NetworkClientMessages::Block(
                 block.clone(),
@@ -435,8 +375,8 @@ fn invalid_blocks() {
                 NetworkResponses::NoResponse
             }),
         );
-        actix::spawn(view_client.send(GetBlock::latest()).then(move |res| {
-            let last_block = res.unwrap().unwrap();
+        actix::spawn(view_client.send(GetBlockWithMerkleTree::latest()).then(move |res| {
+            let (last_block, mut block_merkle_tree) = res.unwrap().unwrap();
             let signer = InMemoryValidatorSigner::from_seed("test", KeyType::ED25519, "test");
             // Send block with invalid chunk mask
             let mut block = Block::produce(
@@ -457,6 +397,7 @@ fn invalid_blocks() {
                 vec![],
                 &signer,
                 last_block.header.next_bp_hash,
+                CryptoHash::default(),
             );
             block.header.inner_rest.chunk_mask = vec![];
             client.do_send(NetworkClientMessages::Block(
@@ -466,6 +407,7 @@ fn invalid_blocks() {
             ));
 
             // Send proper block.
+            block_merkle_tree.insert(last_block.header.hash);
             let block2 = Block::produce(
                 &last_block.header.clone().into(),
                 last_block.header.height + 1,
@@ -484,6 +426,7 @@ fn invalid_blocks() {
                 vec![],
                 &signer,
                 last_block.header.next_bp_hash,
+                block_merkle_tree.root(),
             );
             client.do_send(NetworkClientMessages::Block(block2, PeerInfo::random().id, false));
             future::ready(())
@@ -1100,7 +1043,11 @@ fn test_gc_tail_update() {
     let prev_sync_block = blocks[blocks.len() - 3].clone();
     let sync_block = blocks[blocks.len() - 2].clone();
     env.clients[1].chain.reset_data_pre_state_sync(sync_block.hash()).unwrap();
-    env.clients[1].chain.save_block(&sync_block).unwrap();
+    let mut store_update = env.clients[1].chain.mut_store().store_update();
+    store_update.save_block(prev_sync_block.clone());
+    store_update.inc_block_refcount(&prev_sync_block.hash()).unwrap();
+    store_update.save_block(sync_block.clone());
+    store_update.commit().unwrap();
     env.clients[1]
         .chain
         .reset_heads_post_state_sync(&None, sync_block.hash(), |_| {}, |_| {}, |_| {})
@@ -1149,17 +1096,15 @@ fn test_gas_price_change() {
     genesis.config.gas_limit = gas_limit;
     genesis.config.gas_price_adjustment_rate = gas_price_adjustment_rate;
     genesis.config.runtime_config.storage_amount_per_byte = 0;
+    let genesis = Arc::new(genesis);
+    let chain_genesis = ChainGenesis::from(&genesis);
     let runtimes: Vec<Arc<dyn RuntimeAdapter>> = vec![Arc::new(neard::NightshadeRuntime::new(
         Path::new("."),
         create_test_store(),
-        Arc::new(genesis),
+        genesis,
         vec![],
         vec![],
     ))];
-    let mut chain_genesis = ChainGenesis::test();
-    chain_genesis.min_gas_price = min_gas_price;
-    chain_genesis.gas_price_adjustment_rate = gas_price_adjustment_rate;
-    chain_genesis.gas_limit = gas_limit;
     let mut env = TestEnv::new_with_runtime(chain_genesis, 1, 1, runtimes);
     let genesis_block = env.clients[0].chain.get_block_by_height(0).unwrap();
     let genesis_hash = genesis_block.hash();
@@ -1188,4 +1133,150 @@ fn test_gas_price_change() {
     for i in 2..=4 {
         env.produce_block(0, i);
     }
+}
+
+#[test]
+fn test_invalid_block_root() {
+    let mut env = TestEnv::new(ChainGenesis::test(), 1, 1);
+    let mut b1 = env.clients[0].produce_block(1).unwrap().unwrap();
+    let signer = InMemoryValidatorSigner::from_seed("test0", KeyType::ED25519, "test0");
+    b1.header.inner_lite.block_merkle_root = CryptoHash::default();
+    let (hash, signature) = signer.sign_block_header_parts(
+        b1.header.prev_hash,
+        &b1.header.inner_lite,
+        &b1.header.inner_rest,
+    );
+    b1.header.hash = hash;
+    b1.header.signature = signature;
+    let (_, tip) = env.clients[0].process_block(b1, Provenance::NONE);
+    match tip {
+        Err(e) => match e.kind() {
+            ErrorKind::InvalidBlockMerkleRoot => {}
+            _ => assert!(false, "wrong error: {}", e),
+        },
+        _ => assert!(false, "succeeded, tip: {:?}", tip),
+    }
+}
+
+#[test]
+fn test_incorrect_validator_key_produce_block() {
+    let genesis = Genesis::test(vec!["test0", "test1"], 2);
+    let genesis = Arc::new(genesis);
+    let chain_genesis = ChainGenesis::from(&genesis);
+    let runtime_adapter: Arc<dyn RuntimeAdapter> = Arc::new(neard::NightshadeRuntime::new(
+        Path::new("."),
+        create_test_store(),
+        genesis,
+        vec![],
+        vec![],
+    ));
+    let signer = Arc::new(InMemoryValidatorSigner::from_seed("test0", KeyType::ED25519, "seed"));
+    let mut config = ClientConfig::test(true, 10, 20, 2, false);
+    config.epoch_length = chain_genesis.epoch_length;
+    let mut client = Client::new(
+        config,
+        chain_genesis,
+        runtime_adapter,
+        Arc::new(MockNetworkAdapter::default()),
+        Some(signer),
+        false,
+    )
+    .unwrap();
+    let res = client.produce_block(1);
+    match res {
+        Err(near_client::Error::BlockProducer(_)) => {}
+        _ => panic!("unexpected result: {:?}", res),
+    }
+}
+
+fn test_block_merkle_proof_with_len(n: NumBlocks) {
+    let mut env = TestEnv::new(ChainGenesis::test(), 1, 1);
+    let genesis_block = env.clients[0].chain.get_block_by_height(0).unwrap().clone();
+    let mut blocks = vec![genesis_block.clone()];
+    for i in 1..n {
+        let block = env.clients[0].produce_block(i).unwrap().unwrap();
+        blocks.push(block.clone());
+        env.process_block(0, block, Provenance::PRODUCED);
+    }
+    let head = blocks.pop().unwrap();
+    let root = head.header.inner_lite.block_merkle_root;
+    for block in blocks {
+        let proof = env.clients[0].chain.get_block_proof(&block.hash(), &head.hash()).unwrap();
+        assert!(verify_hash(root, &proof, block.hash()));
+    }
+}
+
+#[test]
+fn test_block_merkle_proof() {
+    for i in 0..50 {
+        test_block_merkle_proof_with_len(i);
+    }
+}
+
+#[test]
+fn test_block_merkle_proof_same_hash() {
+    let mut env = TestEnv::new(ChainGenesis::test(), 1, 1);
+    let genesis_block = env.clients[0].chain.get_block_by_height(0).unwrap().clone();
+    let proof =
+        env.clients[0].chain.get_block_proof(&genesis_block.hash(), &genesis_block.hash()).unwrap();
+    assert!(proof.is_empty());
+}
+
+#[test]
+fn test_data_reset_before_state_sync() {
+    let mut genesis = Genesis::test(vec!["test0"], 1);
+    let epoch_length = 5;
+    genesis.config.epoch_length = epoch_length;
+    let runtimes: Vec<Arc<dyn RuntimeAdapter>> = vec![Arc::new(neard::NightshadeRuntime::new(
+        Path::new("."),
+        create_test_store(),
+        Arc::new(genesis.clone()),
+        vec![],
+        vec![],
+    ))];
+    let mut env = TestEnv::new_with_runtime(ChainGenesis::test(), 1, 1, runtimes);
+    let signer = InMemorySigner::from_seed("test0", KeyType::ED25519, "test0");
+    let genesis_block = env.clients[0].chain.get_block_by_height(0).unwrap();
+    let genesis_hash = genesis_block.hash();
+    let tx = SignedTransaction::create_account(
+        1,
+        "test0".to_string(),
+        "test_account".to_string(),
+        NEAR_BASE,
+        signer.public_key(),
+        &signer,
+        genesis_hash,
+    );
+    env.clients[0].process_tx(tx, false, false);
+    for i in 1..5 {
+        env.produce_block(0, i);
+    }
+    // check that the new account exists
+    let head = env.clients[0].chain.head().unwrap();
+    let head_block = env.clients[0].chain.get_block(&head.last_block_hash).unwrap().clone();
+    let response = env.clients[0]
+        .runtime_adapter
+        .query(
+            0,
+            &head_block.chunks[0].inner.prev_state_root,
+            head.height,
+            0,
+            &head.last_block_hash,
+            &head_block.header.inner_lite.epoch_id,
+            &QueryRequest::ViewAccount { account_id: "test_account".to_string() },
+        )
+        .unwrap();
+    assert!(matches!(response.kind, QueryResponseKind::ViewAccount(_)));
+    env.clients[0].chain.reset_data_pre_state_sync(head_block.hash()).unwrap();
+    // account should not exist after clearing state
+    let response = env.clients[0].runtime_adapter.query(
+        0,
+        &head_block.chunks[0].inner.prev_state_root,
+        head.height,
+        0,
+        &head.last_block_hash,
+        &head_block.header.inner_lite.epoch_id,
+        &QueryRequest::ViewAccount { account_id: "test_account".to_string() },
+    );
+    assert!(response.is_err());
 }

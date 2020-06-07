@@ -3,7 +3,7 @@ use std::sync::Arc;
 use borsh::BorshSerialize;
 use log::debug;
 
-use near_primitives::account::Account;
+use near_primitives::account::{AccessKeyPermission, Account};
 use near_primitives::contract::ContractCode;
 use near_primitives::hash::CryptoHash;
 use near_primitives::receipt::{ActionReceipt, Receipt};
@@ -11,7 +11,7 @@ use near_primitives::transaction::{
     Action, AddKeyAction, DeleteAccountAction, DeleteKeyAction, DeployContractAction,
     FunctionCallAction, StakeAction, TransferAction,
 };
-use near_primitives::types::{AccountId, Balance, ValidatorStake};
+use near_primitives::types::{AccountId, Balance, EpochInfoProvider, ValidatorStake};
 use near_primitives::utils::{
     is_valid_account_id, is_valid_sub_account_id, is_valid_top_level_account_id,
 };
@@ -26,7 +26,6 @@ use near_vm_logic::VMContext;
 use crate::config::{safe_add_gas, RuntimeConfig};
 use crate::ext::RuntimeExt;
 use crate::{ActionResult, ApplyState};
-use near_crypto::key_conversion::convert_public_key;
 use near_crypto::PublicKey;
 use near_primitives::errors::{ActionError, ActionErrorKind, ExternalError, RuntimeError};
 use near_runtime_configs::AccountCreationConfig;
@@ -88,6 +87,7 @@ pub(crate) fn action_function_call(
     action_hash: &CryptoHash,
     config: &RuntimeConfig,
     is_last_action: bool,
+    epoch_info_provider: &dyn EpochInfoProvider,
 ) -> Result<(), RuntimeError> {
     let code = match get_code_with_cache(state_update, account_id, &account) {
         Ok(Some(code)) => code,
@@ -117,6 +117,9 @@ pub(crate) fn action_function_call(
         &action_receipt.signer_public_key,
         action_receipt.gas_price,
         action_hash,
+        &apply_state.epoch_id,
+        &apply_state.last_block_hash,
+        epoch_info_provider,
     );
     // Output data receipts are ignored if the function call is not the last action in the batch.
     let output_data_receivers: Vec<_> = if is_last_action {
@@ -166,6 +169,7 @@ pub(crate) fn action_function_call(
                 .expect("External error deserialization shouldn't fail");
             return match err {
                 ExternalError::StorageError(err) => Err(err.into()),
+                ExternalError::ValidatorError(err) => Err(RuntimeError::ValidatorError(err)),
             };
         }
         Some(VMError::InconsistentStateError(err)) => {
@@ -203,25 +207,6 @@ pub(crate) fn action_stake(
 ) {
     let increment = stake.stake.saturating_sub(account.locked);
 
-    // Make sure the key is ED25519, and can be converted to ristretto
-    match stake.public_key {
-        PublicKey::ED25519(key) => {
-            if convert_public_key(&key).is_none() {
-                result.result = Err(ActionErrorKind::UnsuitableStakingKey {
-                    public_key: stake.public_key.clone(),
-                }
-                .into());
-                return;
-            }
-        }
-        PublicKey::SECP256K1(_) => {
-            result.result =
-                Err(ActionErrorKind::UnsuitableStakingKey { public_key: stake.public_key.clone() }
-                    .into());
-            return;
-        }
-    };
-
     if account.amount >= increment {
         if account.locked == 0 && stake.stake == 0 {
             // if the account hasn't staked, it cannot unstake
@@ -248,6 +233,33 @@ pub(crate) fn action_stake(
         }
         .into());
     }
+}
+
+/// Tries to refunds the allowance of the access key for a gas refund action.
+pub(crate) fn try_refund_allowance(
+    state_update: &mut TrieUpdate,
+    account_id: &AccountId,
+    public_key: &PublicKey,
+    transfer: &TransferAction,
+) -> Result<(), StorageError> {
+    if let Some(mut access_key) = get_access_key(state_update, account_id, public_key)? {
+        let mut updated = false;
+        if let AccessKeyPermission::FunctionCall(function_call_permission) =
+            &mut access_key.permission
+        {
+            if let Some(allowance) = function_call_permission.allowance.as_mut() {
+                let new_allowance = allowance.saturating_add(transfer.deposit);
+                if new_allowance > *allowance {
+                    *allowance = new_allowance;
+                    updated = true;
+                }
+            }
+        }
+        if updated {
+            set_access_key(state_update, account_id.clone(), public_key.clone(), &access_key);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn action_transfer(
@@ -350,7 +362,7 @@ pub(crate) fn action_delete_account(
     if account_balance > 0 {
         result
             .new_receipts
-            .push(Receipt::new_refund(&delete_account.beneficiary_id, account_balance));
+            .push(Receipt::new_balance_refund(&delete_account.beneficiary_id, account_balance));
     }
     remove_account(state_update, account_id)?;
     *actor_id = receipt.predecessor_id.clone();

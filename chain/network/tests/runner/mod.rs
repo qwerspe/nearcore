@@ -13,16 +13,16 @@ use near_chain::ChainGenesis;
 use near_chain_configs::ClientConfig;
 use near_client::{ClientActor, ViewClientActor};
 use near_crypto::KeyType;
+use near_logger_utils::init_test_logger;
 use near_network::test_utils::{
     convert_boot_nodes, expected_routing_tables, open_port, peer_id_from_seed, BanPeerSignal,
     GetInfo, StopSignal, WaitOrTimeout,
 };
 use near_network::types::{OutboundTcpConnect, ROUTED_MESSAGE_TTL};
-use near_network::utils::blacklist_from_vec;
+use near_network::utils::blacklist_from_iter;
 use near_network::{
     NetworkConfig, NetworkRecipient, NetworkRequests, NetworkResponses, PeerInfo, PeerManagerActor,
 };
-use near_primitives::test_utils::init_test_logger;
 use near_primitives::types::{AccountId, ValidatorId};
 use near_primitives::validator_signer::InMemoryValidatorSigner;
 use near_store::test_utils::create_test_store;
@@ -359,7 +359,7 @@ impl StateMachine {
 }
 
 struct TestConfig {
-    max_peer: u32,
+    max_num_peers: u32,
     routed_message_ttl: u8,
     boot_nodes: Vec<usize>,
     blacklist: HashSet<Option<usize>>,
@@ -373,7 +373,7 @@ struct TestConfig {
 impl TestConfig {
     fn new() -> Self {
         Self {
-            max_peer: 100,
+            max_num_peers: 100,
             routed_message_ttl: ROUTED_MESSAGE_TTL,
             boot_nodes: vec![],
             blacklist: HashSet::new(),
@@ -463,9 +463,9 @@ impl Runner {
         self
     }
 
-    pub fn max_peer(mut self, max_peer: u32) -> Self {
+    pub fn max_num_peers(mut self, max_num_peers: u32) -> Self {
         self.apply_all(move |test_config| {
-            test_config.max_peer = max_peer;
+            test_config.max_num_peers = max_num_peers;
         });
         self
     }
@@ -526,25 +526,19 @@ impl Runner {
                 .collect(),
         );
 
-        let blacklist = blacklist_from_vec(
-            &test_config
-                .blacklist
-                .iter()
-                .map(|x| {
-                    if let Some(x) = x {
-                        format!("127.0.0.1:{}", ports[*x]).parse().unwrap()
-                    } else {
-                        "127.0.0.1".parse().unwrap()
-                    }
-                })
-                .collect(),
-        );
+        let blacklist = blacklist_from_iter(test_config.blacklist.iter().map(|x| {
+            if let Some(x) = x {
+                format!("127.0.0.1:{}", ports[*x])
+            } else {
+                "127.0.0.1".to_string()
+            }
+        }));
 
         let mut network_config =
             NetworkConfig::from_seed(accounts_id[node_id].as_str(), ports[node_id].clone());
 
         network_config.ban_window = test_config.ban_window;
-        network_config.max_peer = test_config.max_peer;
+        network_config.max_num_peers = test_config.max_num_peers;
         network_config.ttl_account_id_router = Duration::from_secs(5);
         network_config.routed_message_ttl = test_config.routed_message_ttl;
         network_config.blacklist = blacklist;
@@ -767,6 +761,23 @@ pub fn change_account_id(node_id: usize, account_id: String) -> ActionFn {
                     })
                     .map(drop),
             );
+        },
+    )
+}
+
+/// Wait for predicate to return True.
+pub fn wait_for<T>(predicate: T) -> ActionFn
+where
+    T: 'static + Fn() -> bool,
+{
+    Box::new(
+        move |_info: SharedRunningInfo,
+              flag: Arc<AtomicBool>,
+              _ctx: &mut Context<WaitOrTimeout>,
+              _runner: Addr<Runner>| {
+            if predicate() {
+                flag.store(true, Ordering::Relaxed);
+            }
         },
     )
 }

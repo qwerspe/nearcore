@@ -26,6 +26,9 @@ near-network = { path = "../network" }
 near-jsonrpc-client = { path = "client" }
 near-rpc-error-macro = { path = "../../tools/rpctypegen/macro" }
 
+[dev-dependencies]
+near-logger-utils = { path = "../../test-utils/logger" }
+
 [features]
 dump_errors_schema = ["near-rpc-error-macro/dump_errors_schema"]
 adversarial = []

@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
-use near_crypto::{PublicKey, Signature, Signer};
+use near_crypto::{PublicKey, Signature};
 
 use crate::account::AccessKey;
 use crate::errors::TxExecutionError;
@@ -173,25 +173,6 @@ impl SignedTransaction {
     pub fn get_hash(&self) -> CryptoHash {
         self.hash
     }
-
-    pub fn from_actions(
-        nonce: Nonce,
-        signer_id: AccountId,
-        receiver_id: AccountId,
-        signer: &dyn Signer,
-        actions: Vec<Action>,
-        block_hash: CryptoHash,
-    ) -> Self {
-        Transaction {
-            nonce,
-            signer_id,
-            public_key: signer.public_key(),
-            receiver_id,
-            block_hash,
-            actions,
-        }
-        .sign(signer)
-    }
 }
 
 impl Hash for SignedTransaction {
@@ -247,11 +228,32 @@ impl Default for ExecutionStatus {
     }
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, PartialEq, Clone, Default)]
+/// ExecutionOutcome for proof. Excludes logs.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, PartialEq, Clone)]
 struct PartialExecutionOutcome {
     pub receipt_ids: Vec<CryptoHash>,
     pub gas_burnt: Gas,
-    pub status: ExecutionStatus,
+    pub status: PartialExecutionStatus,
+}
+
+/// ExecutionStatus for proof. Excludes failure debug info.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, PartialEq, Clone)]
+pub enum PartialExecutionStatus {
+    Unknown,
+    Failure,
+    SuccessValue(Vec<u8>),
+    SuccessReceiptId(CryptoHash),
+}
+
+impl From<ExecutionStatus> for PartialExecutionStatus {
+    fn from(status: ExecutionStatus) -> PartialExecutionStatus {
+        match status {
+            ExecutionStatus::Unknown => PartialExecutionStatus::Unknown,
+            ExecutionStatus::Failure(_) => PartialExecutionStatus::Failure,
+            ExecutionStatus::SuccessValue(value) => PartialExecutionStatus::SuccessValue(value),
+            ExecutionStatus::SuccessReceiptId(id) => PartialExecutionStatus::SuccessReceiptId(id),
+        }
+    }
 }
 
 /// Execution outcome for one signed transaction or one receipt.
@@ -274,7 +276,7 @@ impl ExecutionOutcome {
             &PartialExecutionOutcome {
                 receipt_ids: self.receipt_ids.clone(),
                 gas_burnt: self.gas_burnt,
-                status: self.status.clone(),
+                status: self.status.clone().into(),
             }
             .try_to_vec()
             .expect("Failed to serialize"),
@@ -346,7 +348,7 @@ mod tests {
 
     use borsh::BorshDeserialize;
 
-    use near_crypto::{InMemorySigner, KeyType, Signature};
+    use near_crypto::{InMemorySigner, KeyType, Signature, Signer};
 
     use crate::account::{AccessKeyPermission, FunctionCallPermission};
     use crate::serialize::to_base;
